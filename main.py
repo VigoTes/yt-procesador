@@ -91,6 +91,8 @@ class JobAccepted(BaseModel):
 class WebhookPayload(BaseModel):
     job_id: str
     status: Literal["success", "error"]
+    youtube_url: str
+    model: WhisperModel
     # Campos presentes cuando status == "success"
     title: str | None = None
     duration_seconds: float | None = None
@@ -151,6 +153,7 @@ async def _notify_webhook(webhook_url: str, payload: WebhookPayload, retries: in
 
 
 async def _transcribe_task(job_id: str, url: str, model_name: WhisperModel, language: str | None, webhook_url: str):
+
     """Tarea en background: descarga, transcribe y notifica al webhook."""
     mp3_path = None
     try:
@@ -172,6 +175,8 @@ async def _transcribe_task(job_id: str, url: str, model_name: WhisperModel, lang
         payload = WebhookPayload(
             job_id=job_id,
             status="success",
+            youtube_url=url,
+            model=model_name,
             title=info.get("title", "Sin título"),
             duration_seconds=info.get("duration"),
             language=result.get("language", "unknown"),
@@ -184,6 +189,8 @@ async def _transcribe_task(job_id: str, url: str, model_name: WhisperModel, lang
         payload = WebhookPayload(
             job_id=job_id,
             status="error",
+            youtube_url=url,
+            model=model_name,
             error=str(exc),
         )
 
