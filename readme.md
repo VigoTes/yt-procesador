@@ -37,7 +37,7 @@ choco install ffmpeg
 ### Instalación de dependencias Python
 
 ```bash
-pip install fastapi uvicorn openai-whisper yt-dlp pydantic
+pip install fastapi uvicorn openai-whisper yt-dlp pydantic python-dotenv
 ```
 
 ---
@@ -48,13 +48,31 @@ pip install fastapi uvicorn openai-whisper yt-dlp pydantic
 python main.py
 ```
 
-El servidor arrancará en `http://0.0.0.0:8089` por defecto.
+El servidor arrancará en `http://0.0.0.0:8080` por defecto.
 
 También puedes ejecutarlo con uvicorn directamente:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8089 --reload
+uvicorn main:app --host 0.0.0.0 --port 8080 --reload
 ```
+
+---
+
+## 🔐 Autenticación
+
+Todos los endpoints están protegidos con una API Key. Debes enviarla en el header de cada request:
+
+```
+X-API-Key: tu_clave_secreta_aqui
+```
+
+La clave se define en un archivo `.env` en la misma carpeta que `main.py`:
+
+```env
+API_KEY=tu_clave_secreta_aqui
+```
+
+> ⚠️ Nunca subas el archivo `.env` a tu repositorio. Agrégalo al `.gitignore`.
 
 ---
 
@@ -63,6 +81,8 @@ uvicorn main:app --host 0.0.0.0 --port 8089 --reload
 ```
 tu_proyecto/
 ├── main.py          # Aplicación principal
+├── .env             # Variables de entorno (API Key)
+├── .gitignore       # Debe incluir .env
 └── downloads/       # Carpeta temporal (se crea automáticamente)
 ```
 
@@ -72,8 +92,8 @@ tu_proyecto/
 
 Una vez corriendo el servidor, accede a:
 
-- **Swagger UI:** `http://localhost:8089/docs`
-- **ReDoc:** `http://localhost:8089/redoc`
+- **Swagger UI:** `http://localhost:8080/docs`
+- **ReDoc:** `http://localhost:8080/redoc`
 
 ---
 
@@ -131,8 +151,9 @@ Descarga el audio del video y lo transcribe con Whisper.
 
 **Ejemplo de request:**
 ```bash
-curl -X POST "http://localhost:8089/transcribe" \
+curl -X POST "http://localhost:8080/transcribe" \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: tu_clave_secreta_aqui" \
   -d '{
     "url": "https://www.youtube.com/watch?v=XXXX",
     "model": "small",
@@ -164,8 +185,9 @@ Descarga el audio del video y lo retorna como archivo MP3.
 
 **Ejemplo de request:**
 ```bash
-curl -X POST "http://localhost:8089/download-mp3" \
+curl -X POST "http://localhost:8080/download-mp3" \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: tu_clave_secreta_aqui" \
   -d '{"url": "https://www.youtube.com/watch?v=XXXX"}' \
   --output audio.mp3
 ```

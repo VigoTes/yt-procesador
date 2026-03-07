@@ -7,11 +7,16 @@ from typing import Literal
 
 import whisper
 import yt_dlp
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, HttpUrl
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -26,6 +31,17 @@ def get_model(name: WhisperModel) -> whisper.Whisper:
         print(f"[whisper] Cargando modelo '{name}'...")
         _models[name] = whisper.load_model(name)
     return _models[name]
+
+
+# ─── API Key Auth ─────────────────────────────────────────────────────────────
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(key: str = Depends(api_key_header)):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API_KEY no configurada en el servidor.")
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="API Key inválida o ausente.")
 
 
 # ─── Lifespan (precarga modelo base al iniciar) ────────────────────────────────
@@ -104,7 +120,7 @@ def root():
     return {"status": "ok", "message": "YouTube Transcriber API — visita /docs"}
 
 
-@app.get("/models", tags=["Info"])
+@app.get("/models", tags=["Info"], dependencies=[Depends(verify_api_key)])
 def list_models():
     """Retorna los modelos disponibles y cuáles ya están cargados en memoria."""
     available = ["tiny", "base", "small", "medium", "large"]
@@ -114,7 +130,7 @@ def list_models():
     }
 
 
-@app.post("/transcribe", response_model=TranscribeResponse, tags=["Transcribe"])
+@app.post("/transcribe", response_model=TranscribeResponse, tags=["Transcribe"], dependencies=[Depends(verify_api_key)])
 def transcribe_video(req: TranscribeRequest):
     """
     Descarga el audio de una URL de YouTube y lo transcribe con Whisper.
@@ -159,7 +175,7 @@ def transcribe_video(req: TranscribeRequest):
             mp3_path.unlink(missing_ok=True)
 
 
-@app.post("/download-mp3", tags=["Download"])
+@app.post("/download-mp3", tags=["Download"], dependencies=[Depends(verify_api_key)])
 def download_mp3(req: DownloadRequest):
     """
     Descarga el audio de YouTube como MP3 y lo retorna como archivo.
@@ -174,7 +190,7 @@ def download_mp3(req: DownloadRequest):
             path=str(mp3_path),
             media_type="audio/mpeg",
             filename=filename,
-            background=BackgroundTasks(),  # el archivo se borra después de enviarlo
+            background=BackgroundTasks(),
         )
 
     except yt_dlp.utils.DownloadError as e:
@@ -183,7 +199,7 @@ def download_mp3(req: DownloadRequest):
         raise HTTPException(status_code=500, detail=f"Error inesperado: {e}")
 
 
-@app.get("/info", tags=["Info"])
+@app.get("/info", tags=["Info"], dependencies=[Depends(verify_api_key)])
 def video_info(url: str):
     """
     Retorna metadata de un video de YouTube sin descargarlo.
@@ -205,13 +221,7 @@ def video_info(url: str):
         raise HTTPException(status_code=422, detail=str(e))
 
 
-
-
-
-
-
-
-
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
