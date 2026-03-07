@@ -19,6 +19,15 @@ from pydantic import BaseModel, HttpUrl
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
+# Detectar ffmpeg al importar para dar un error claro desde el inicio
+import shutil
+FFMPEG_BIN = shutil.which("ffmpeg") or os.getenv("FFMPEG_PATH", "ffmpeg")
+FFPROBE_BIN = shutil.which("ffprobe") or os.getenv("FFPROBE_PATH", "ffprobe")
+if not shutil.which(FFMPEG_BIN):
+    raise RuntimeError(
+        f"ffmpeg no encontrado. Instálalo o setea la variable de entorno FFMPEG_PATH."
+    )
+
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -93,7 +102,7 @@ def _extract_audio(video_path: Path, job_id: str) -> tuple[Path, float | None]:
     mp3_path = DOWNLOAD_DIR / f"{job_id}.mp3"
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-i", str(video_path),
         "-vn",                      # sin video
         "-ar", "16000",             # sample rate óptimo para Whisper
@@ -108,7 +117,7 @@ def _extract_audio(video_path: Path, job_id: str) -> tuple[Path, float | None]:
 
     # Obtener duración con ffprobe
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
         capture_output=True, text=True,
     )
@@ -276,21 +285,28 @@ async def extract_mp3(
     video_path = await _save_upload(file, job_id)
 
     try:
-        mp3_path, _ = _extract_audio(video_path, job_id)
+        loop = asyncio.get_event_loop()
+        mp3_path, _ = await loop.run_in_executor(None, _extract_audio, video_path, job_id)
         stem = Path(file.filename).stem if file.filename else job_id
+
+        # El video ya no se necesita; el MP3 lo borra FileResponse al terminar de enviarlo
+        video_path.unlink(missing_ok=True)
+
+        bg = BackgroundTasks()
+        bg.add_task(lambda: mp3_path.unlink(missing_ok=True))
 
         return FileResponse(
             path=str(mp3_path),
             media_type="audio/mpeg",
             filename=f"{stem}.mp3",
+            background=bg,
         )
     except RuntimeError as e:
+        video_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
+        video_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Error inesperado: {e}")
-    finally:
-        if video_path.exists():
-            video_path.unlink(missing_ok=True)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
