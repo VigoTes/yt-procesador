@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+import httpx
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -23,7 +24,6 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 WhisperModel = Literal["tiny", "base", "small", "medium", "large"]
 
-# Cache de modelos para no recargar en cada petición
 _models: dict[str, whisper.Whisper] = {}
 
 def get_model(name: WhisperModel) -> whisper.Whisper:
@@ -44,13 +44,12 @@ def verify_api_key(key: str = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="API Key inválida o ausente.")
 
 
-# ─── Lifespan (precarga modelo base al iniciar) ────────────────────────────────
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_model("base")   # precarga en startup
+    get_model("base")
     yield
-    # cleanup: borrar archivos temporales al apagar
     for f in DOWNLOAD_DIR.iterdir():
         f.unlink(missing_ok=True)
 
@@ -70,7 +69,9 @@ app = FastAPI(
 class TranscribeRequest(BaseModel):
     url: HttpUrl
     model: WhisperModel = "base"
-    language: str | None = None   # ej: "es", "en". None = autodetect
+    language: str | None = None
+    webhook_url: HttpUrl  # ← nuevo campo obligatorio
+
 
 class TranscribeResponse(BaseModel):
     job_id: str
@@ -81,6 +82,25 @@ class TranscribeResponse(BaseModel):
     segments_count: int
 
 
+class JobAccepted(BaseModel):
+    job_id: str
+    status: str = "accepted"
+    message: str
+
+
+class WebhookPayload(BaseModel):
+    job_id: str
+    status: Literal["success", "error"]
+    # Campos presentes cuando status == "success"
+    title: str | None = None
+    duration_seconds: float | None = None
+    language: str | None = None
+    text: str | None = None
+    segments_count: int | None = None
+    # Campo presente cuando status == "error"
+    error: str | None = None
+
+
 class DownloadRequest(BaseModel):
     url: HttpUrl
 
@@ -88,7 +108,6 @@ class DownloadRequest(BaseModel):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _download_audio(url: str, job_id: str) -> tuple[Path, dict]:
-    """Descarga el audio de YouTube y retorna la ruta al MP3 + metadata."""
     out_template = str(DOWNLOAD_DIR / f"{job_id}.%(ext)s")
 
     ydl_opts = {
@@ -113,6 +132,69 @@ def _download_audio(url: str, job_id: str) -> tuple[Path, dict]:
     return mp3_path, info
 
 
+async def _notify_webhook(webhook_url: str, payload: WebhookPayload, retries: int = 3):
+    """Envía el resultado al webhook con reintentos exponenciales."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(1, retries + 1):
+            try:
+                resp = await client.post(webhook_url, json=payload.model_dump())
+                resp.raise_for_status()
+                print(f"[webhook] Notificación enviada a {webhook_url} (job={payload.job_id})")
+                return
+            except Exception as exc:
+                wait = 2 ** attempt
+                print(f"[webhook] Intento {attempt}/{retries} fallido: {exc}. Reintentando en {wait}s...")
+                if attempt < retries:
+                    await asyncio.sleep(wait)
+
+    print(f"[webhook] No se pudo notificar a {webhook_url} tras {retries} intentos.")
+
+
+async def _transcribe_task(job_id: str, url: str, model_name: WhisperModel, language: str | None, webhook_url: str):
+    """Tarea en background: descarga, transcribe y notifica al webhook."""
+    mp3_path = None
+    try:
+        # 1. Descargar audio (bloqueante → corre en threadpool)
+        loop = asyncio.get_event_loop()
+        mp3_path, info = await loop.run_in_executor(None, _download_audio, url, job_id)
+
+        # 2. Transcribir (bloqueante → corre en threadpool)
+        model = get_model(model_name)
+        transcribe_opts = {}
+        if language:
+            transcribe_opts["language"] = language
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: model.transcribe(str(mp3_path), **transcribe_opts)
+        )
+
+        payload = WebhookPayload(
+            job_id=job_id,
+            status="success",
+            title=info.get("title", "Sin título"),
+            duration_seconds=info.get("duration"),
+            language=result.get("language", "unknown"),
+            text=result["text"].strip(),
+            segments_count=len(result.get("segments", [])),
+        )
+
+    except Exception as exc:
+        print(f"[job {job_id}] Error durante el procesamiento: {exc}")
+        payload = WebhookPayload(
+            job_id=job_id,
+            status="error",
+            error=str(exc),
+        )
+
+    finally:
+        if mp3_path and mp3_path.exists():
+            mp3_path.unlink(missing_ok=True)
+
+    # 3. Notificar resultado
+    await _notify_webhook(webhook_url, payload)
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
@@ -122,64 +204,50 @@ def root():
 
 @app.get("/models", tags=["Info"], dependencies=[Depends(verify_api_key)])
 def list_models():
-    """Retorna los modelos disponibles y cuáles ya están cargados en memoria."""
     available = ["tiny", "base", "small", "medium", "large"]
-    return {
-        "available": available,
-        "loaded": list(_models.keys()),
-    }
+    return {"available": available, "loaded": list(_models.keys())}
 
 
-@app.post("/transcribe", response_model=TranscribeResponse, tags=["Transcribe"], dependencies=[Depends(verify_api_key)])
-def transcribe_video(req: TranscribeRequest):
+@app.post(
+    "/transcribe",
+    response_model=JobAccepted,
+    status_code=202,
+    tags=["Transcribe"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def transcribe_video(req: TranscribeRequest, background_tasks: BackgroundTasks):
     """
-    Descarga el audio de una URL de YouTube y lo transcribe con Whisper.
+    Encola la transcripción del video en background y retorna inmediatamente.
+
+    Cuando el trabajo finaliza (o falla), se hace un **POST** a `webhook_url` con
+    el resultado completo (schema `WebhookPayload`).
 
     - **url**: URL del video de YouTube
-    - **model**: Modelo de Whisper a usar (default: `base`)
-    - **language**: Código de idioma opcional (ej: `es`, `en`). Si no se pasa, se autodetecta.
+    - **model**: Modelo Whisper a usar (default: `base`)
+    - **language**: Código de idioma opcional (`es`, `en`…). `null` = autodetect
+    - **webhook_url**: URL que recibirá el resultado cuando la tarea termine
     """
     job_id = uuid.uuid4().hex[:8]
-    mp3_path = None
 
-    try:
-        # 1. Descargar audio
-        mp3_path, info = _download_audio(str(req.url), job_id)
+    background_tasks.add_task(
+        _transcribe_task,
+        job_id=job_id,
+        url=str(req.url),
+        model_name=req.model,
+        language=req.language,
+        webhook_url=str(req.webhook_url),
+    )
 
-        # 2. Transcribir
-        model = get_model(req.model)
-        transcribe_opts = {}
-        if req.language:
-            transcribe_opts["language"] = req.language
-
-        result = model.transcribe(str(mp3_path), **transcribe_opts)
-
-        return TranscribeResponse(
-            job_id=job_id,
-            title=info.get("title", "Sin título"),
-            duration_seconds=info.get("duration"),
-            language=result.get("language", "unknown"),
-            text=result["text"].strip(),
-            segments_count=len(result.get("segments", [])),
-        )
-
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=422, detail=f"Error al descargar: {e}")
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error inesperado: {e}")
-    finally:
-        # Limpiar MP3 temporal
-        if mp3_path and mp3_path.exists():
-            mp3_path.unlink(missing_ok=True)
+    return JobAccepted(
+        job_id=job_id,
+        status="accepted",
+        message=f"Job encolado. El resultado se enviará a {req.webhook_url}",
+    )
 
 
 @app.post("/download-mp3", tags=["Download"], dependencies=[Depends(verify_api_key)])
 def download_mp3(req: DownloadRequest):
-    """
-    Descarga el audio de YouTube como MP3 y lo retorna como archivo.
-    """
+    """Descarga el audio de YouTube como MP3 y lo retorna como archivo."""
     job_id = uuid.uuid4().hex[:8]
 
     try:
@@ -192,7 +260,6 @@ def download_mp3(req: DownloadRequest):
             filename=filename,
             background=BackgroundTasks(),
         )
-
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail=f"Error al descargar: {e}")
     except Exception as e:
@@ -201,11 +268,7 @@ def download_mp3(req: DownloadRequest):
 
 @app.get("/info", tags=["Info"], dependencies=[Depends(verify_api_key)])
 def video_info(url: str):
-    """
-    Retorna metadata de un video de YouTube sin descargarlo.
-
-    - **url**: URL del video (query param)
-    """
+    """Retorna metadata de un video de YouTube sin descargarlo."""
     try:
         with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
             info = ydl.extract_info(url, download=False)
