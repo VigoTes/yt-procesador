@@ -19,7 +19,6 @@ from pydantic import BaseModel, HttpUrl
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
-# Detectar ffmpeg al importar para dar un error claro desde el inicio
 import shutil
 FFMPEG_BIN = shutil.which("ffmpeg") or os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE_BIN = shutil.which("ffprobe") or os.getenv("FFPROBE_PATH", "ffprobe")
@@ -83,6 +82,7 @@ class JobAccepted(BaseModel):
 
 class WebhookPayload(BaseModel):
     job_id: str
+    codVideo: str
     status: Literal["success", "error"]
     filename: str
     model: WhisperModel
@@ -104,9 +104,9 @@ def _extract_audio(video_path: Path, job_id: str) -> tuple[Path, float | None]:
     cmd = [
         FFMPEG_BIN, "-y",
         "-i", str(video_path),
-        "-vn",                      # sin video
-        "-ar", "16000",             # sample rate óptimo para Whisper
-        "-ac", "1",                 # mono
+        "-vn",
+        "-ar", "16000",
+        "-ac", "1",
         "-b:a", "192k",
         str(mp3_path),
     ]
@@ -115,7 +115,6 @@ def _extract_audio(video_path: Path, job_id: str) -> tuple[Path, float | None]:
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg falló: {result.stderr}")
 
-    # Obtener duración con ffprobe
     probe = subprocess.run(
         [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
@@ -158,6 +157,7 @@ async def _notify_webhook(webhook_url: str, payload: WebhookPayload, retries: in
 
 async def _transcribe_task(
     job_id: str,
+    codVideo: str,
     video_path: Path,
     original_filename: str,
     model_name: WhisperModel,
@@ -187,6 +187,7 @@ async def _transcribe_task(
 
         payload = WebhookPayload(
             job_id=job_id,
+            codVideo=codVideo,
             status="success",
             filename=original_filename,
             model=model_name,
@@ -200,6 +201,7 @@ async def _transcribe_task(
         print(f"[job {job_id}] Error: {exc}")
         payload = WebhookPayload(
             job_id=job_id,
+            codVideo=codVideo,
             status="error",
             filename=original_filename,
             model=model_name,
@@ -240,6 +242,7 @@ def list_models():
 async def transcribe_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Archivo de video (mp4, mkv, avi, mov, etc.)"),
+    codVideo: str = Form(..., description="Código identificador del video"),
     model: WhisperModel = Form("base"),
     language: str | None = Form(None, description="Código de idioma opcional (es, en…). None = autodetect"),
     webhook_url: str = Form(..., description="URL que recibirá el resultado cuando la tarea termine"),
@@ -252,6 +255,7 @@ async def transcribe_video(
 
     Enviar como **multipart/form-data**:
     - **file**: archivo de video
+    - **codVideo**: código identificador del video (obligatorio)
     - **model**: modelo Whisper a usar (default: `base`)
     - **language**: código de idioma opcional. `null` = autodetect
     - **webhook_url**: URL que recibirá el resultado
@@ -262,6 +266,7 @@ async def transcribe_video(
     background_tasks.add_task(
         _transcribe_task,
         job_id=job_id,
+        codVideo=codVideo,
         video_path=video_path,
         original_filename=file.filename or "video",
         model_name=model,
@@ -289,7 +294,6 @@ async def extract_mp3(
         mp3_path, _ = await loop.run_in_executor(None, _extract_audio, video_path, job_id)
         stem = Path(file.filename).stem if file.filename else job_id
 
-        # El video ya no se necesita; el MP3 lo borra FileResponse al terminar de enviarlo
         video_path.unlink(missing_ok=True)
 
         bg = BackgroundTasks()
