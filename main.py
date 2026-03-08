@@ -86,13 +86,23 @@ class WebhookPayload(BaseModel):
     status: Literal["success", "error"]
     filename: str
     model: WhisperModel
-    # Campos presentes cuando status == "success"
     duration_seconds: float | None = None
     language: str | None = None
     text: str | None = None
     segments_count: int | None = None
-    # Campo presente cuando status == "error"
     error: str | None = None
+
+
+class ScheduledGetRequest(BaseModel):
+    url: str
+    delay_seconds: int
+
+class ScheduledGetAccepted(BaseModel):
+    job_id: str
+    status: str = "scheduled"
+    url: str
+    delay_seconds: int
+    message: str
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -169,12 +179,10 @@ async def _transcribe_task(
     try:
         loop = asyncio.get_event_loop()
 
-        # 1. Extraer audio con FFmpeg (bloqueante → threadpool)
         mp3_path, duration = await loop.run_in_executor(
             None, _extract_audio, video_path, job_id
         )
 
-        # 2. Transcribir (bloqueante → threadpool)
         model = get_model(model_name)
         transcribe_opts = {}
         if language:
@@ -209,14 +217,24 @@ async def _transcribe_task(
         )
 
     finally:
-        # Limpiar archivos temporales
         if mp3_path and mp3_path.exists():
             mp3_path.unlink(missing_ok=True)
         if video_path.exists():
             video_path.unlink(missing_ok=True)
 
-    # 3. Notificar resultado
     await _notify_webhook(webhook_url, payload)
+
+
+async def _delayed_get_task(job_id: str, url: str, delay_seconds: int):
+    """Espera `delay_seconds` y luego ejecuta un GET a `url`."""
+    print(f"[schedule-get] Job {job_id} — esperando {delay_seconds}s para llamar a: {url}")
+    await asyncio.sleep(delay_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            print(f"[schedule-get] Job {job_id} — GET {url} → HTTP {resp.status_code}")
+    except Exception as exc:
+        print(f"[schedule-get] Job {job_id} — Error al llamar a {url}: {exc}")
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -230,6 +248,48 @@ def root():
 def list_models():
     available = ["tiny", "base", "small", "medium", "large"]
     return {"available": available, "loaded": list(_models.keys())}
+
+
+@app.post(
+    "/schedule-get",
+    response_model=ScheduledGetAccepted,
+    status_code=202,
+    tags=["Scheduler"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def schedule_get(
+    request: ScheduledGetRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Programa un GET diferido a una URL.
+
+    Retorna **inmediatamente** con un `job_id` y encola la llamada en background.
+    Pasado `delay_seconds`, se ejecuta un **GET** a `url`.
+
+    Body JSON:
+    - **url**: URL destino a llamar
+    - **delay_seconds**: segundos a esperar antes de ejecutar el GET (mínimo 0)
+    """
+    if request.delay_seconds < 0:
+        raise HTTPException(status_code=422, detail="delay_seconds no puede ser negativo.")
+
+    job_id = uuid.uuid4().hex[:8]
+
+    background_tasks.add_task(
+        _delayed_get_task,
+        job_id=job_id,
+        url=request.url,
+        delay_seconds=request.delay_seconds,
+    )
+
+    return ScheduledGetAccepted(
+        job_id=job_id,
+        status="scheduled",
+        url=request.url,
+        delay_seconds=request.delay_seconds,
+        message=f"GET a '{request.url}' se ejecutará en {request.delay_seconds} segundos.",
+    )
 
 
 @app.post(
@@ -252,13 +312,6 @@ async def transcribe_video(
 
     Cuando el trabajo finaliza (o falla), se hace un **POST** a `webhook_url` con
     el resultado completo (schema `WebhookPayload`).
-
-    Enviar como **multipart/form-data**:
-    - **file**: archivo de video
-    - **codVideo**: código identificador del video (obligatorio)
-    - **model**: modelo Whisper a usar (default: `base`)
-    - **language**: código de idioma opcional. `null` = autodetect
-    - **webhook_url**: URL que recibirá el resultado
     """
     job_id = uuid.uuid4().hex[:8]
     video_path = await _save_upload(file, job_id)
